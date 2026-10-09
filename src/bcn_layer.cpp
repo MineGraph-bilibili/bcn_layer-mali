@@ -10,6 +10,10 @@ std::unordered_map<void *, VkPhysicalDeviceFeatures> featuresMap;
 std::unordered_map<void *, VkPhysicalDeviceProperties2> propertiesMap;
 std::unordered_map<void *, VkPhysicalDeviceDriverProperties> driverPropertiesMap;
 std::unordered_map<void *, std::shared_ptr<struct device>> deviceMap;
+/* v2 fix: the bundled vk_layer.h is a 1.0-era header whose dispatch table has
+ * no GetPhysicalDeviceFormatProperties2 member, so keep the next-chain pointer
+ * in a separate map (keyed by instance handle). */
+std::unordered_map<void *, PFN_vkGetPhysicalDeviceFormatProperties2> formatProps2Map;
 
 bool bcn_compute_auto = false;
 
@@ -78,7 +82,11 @@ BCnLayer_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
     {
     	scoped_lock l(global_lock);
     	instanceDispatch[GetKey(*pInstance)] = table;
-    	instanceMap[GetKey(*pInstance)] = *pInstance;	
+    	instanceMap[GetKey(*pInstance)] = *pInstance;
+    	/* v2 fix: stash the next-chain FormatProperties2 pointer (1.0-era
+    	 * dispatch table cannot hold it). */
+    	formatProps2Map[GetKey(*pInstance)] =
+    		(PFN_vkGetPhysicalDeviceFormatProperties2)gip(*pInstance, "vkGetPhysicalDeviceFormatProperties2");
     }
 
     return VK_SUCCESS;
@@ -96,6 +104,7 @@ BCnLayer_DestroyInstance(VkInstance instance,
 	table.DestroyInstance(instance, pAllocator);
 	instanceMap.erase(GetKey(instance));
 	instanceDispatch.erase(GetKey(instance));
+	formatProps2Map.erase(GetKey(instance));
 }
 
 VK_LAYER_EXPORT VkResult VKAPI_CALL
@@ -360,6 +369,73 @@ BCnLayer_GetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice,
    }
 }
 
+/* v2 fix: DXVK >= 2.0 queries format support exclusively through
+ * vkGetPhysicalDeviceFormatProperties2 (reading VkFormatProperties3 from the
+ * pNext chain).  Forward to the next layer, patch BC formats exactly like the
+ * legacy hook above, and mirror the patch into any VkFormatProperties3 found
+ * in the pNext chain (both optimal and linear tiling groups). */
+VKAPI_ATTR void VKAPI_CALL
+BCnLayer_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
+                                            VkFormat format,
+                                            VkFormatProperties2 *pFormatProperties)
+{
+	scoped_lock l(global_lock);
+
+	VkInstance instance = instanceMap[GetKey(physicalDevice)];
+	auto it = formatProps2Map.find(GetKey(instance));
+	if (it == formatProps2Map.end() || !it->second) {
+		Logger::log("error", "FormatProperties2: next-chain pointer missing");
+		return;
+	}
+
+	it->second(physicalDevice, format, pFormatProperties);
+
+	VkPhysicalDeviceProperties2 props2 = propertiesMap[GetKey(physicalDevice)];
+    VkPhysicalDeviceDriverProperties driverProps = driverPropertiesMap[GetKey(physicalDevice)];
+
+    switch (format) {
+    	case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+    	case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+    	case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    	case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+        case VK_FORMAT_BC2_UNORM_BLOCK:
+   		case VK_FORMAT_BC2_SRGB_BLOCK:
+   		case VK_FORMAT_BC3_UNORM_BLOCK:
+   		case VK_FORMAT_BC3_SRGB_BLOCK:
+   			if (bcn_compute_auto && driverProps.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY)
+   				break;
+   		case VK_FORMAT_BC4_UNORM_BLOCK:
+   		case VK_FORMAT_BC4_SNORM_BLOCK:
+   		case VK_FORMAT_BC5_UNORM_BLOCK:
+   		case VK_FORMAT_BC5_SNORM_BLOCK:
+   		case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+   		case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+   		case VK_FORMAT_BC7_UNORM_BLOCK:
+   		case VK_FORMAT_BC7_SRGB_BLOCK:
+   			if (bcn_compute_auto && ((driverProps.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY && props2.properties.driverVersion > VK_MAKE_VERSION(512, 530, 0)) ||
+   			                         driverProps.driverID == VK_DRIVER_ID_MESA_TURNIP))
+   			{
+   				break;
+   			}
+
+   			pFormatProperties->formatProperties.optimalTilingFeatures |=
+   				VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+   				VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+
+   			for (void *pNext = pFormatProperties->pNext; pNext;
+   			     pNext = (void *)((VkBaseOutStructure *)pNext)->pNext) {
+   				if (((VkBaseOutStructure *)pNext)->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) {
+   					VkFormatProperties3 *p3 = (VkFormatProperties3 *)pNext;
+   					p3->optimalTilingFeatures  |= pFormatProperties->formatProperties.optimalTilingFeatures;
+   					p3->linearTilingFeatures   |= pFormatProperties->formatProperties.optimalTilingFeatures;
+   				}
+   			}
+   			return;
+   		default:
+   			break;
+   }
+}
+
 VK_LAYER_EXPORT VkResult VKAPI_CALL
 BCnLayer_CreateDevice(VkPhysicalDevice physicalDevice,
 					  const VkDeviceCreateInfo *pCreateInfo,
@@ -544,6 +620,7 @@ BCnLayer_GetDeviceProcAddr(VkDevice device,
 	GETPROCADDR(AllocateCommandBuffers);
 	GETPROCADDR(FreeCommandBuffers);
 	GETPROCADDR(CmdCopyBufferToImage);
+	GETPROCADDR(CmdCopyBufferToImage2);
 	GETPROCADDR(GetDeviceQueue);
 	GETPROCADDR(QueueSubmit);
 	GETPROCADDR(CreateFence);
@@ -568,6 +645,7 @@ BCnLayer_GetInstanceProcAddr(VkInstance instance,
 	GETPROCADDR(EnumeratePhysicalDevices)
 	GETPROCADDR(GetPhysicalDeviceFeatures);
 	GETPROCADDR(GetPhysicalDeviceFormatProperties);
+	GETPROCADDR(GetPhysicalDeviceFormatProperties2);
 	GETPROCADDR(GetPhysicalDeviceImageFormatProperties);
 	GETPROCADDR(GetPhysicalDeviceImageFormatProperties2);
 	GETPROCADDR(GetPhysicalDeviceFeatures2);

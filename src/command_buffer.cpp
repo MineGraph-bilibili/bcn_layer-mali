@@ -138,3 +138,43 @@ BCnLayer_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
 		}
 	}
 }
+
+/* v1 fix: DXVK >= 2.0 goes through vkCmdCopyBufferToImage2 exclusively
+ * (copy_commands2 entered Vulkan 1.3 core, no extension needed).  Without
+ * this hook BC data reached the renamed RGBA image undecoded (RGB noise).
+ * Convert VkBufferImageCopy2 regions to legacy VkBufferImageCopy field by
+ * field and forward to the legacy hook. */
+VK_LAYER_EXPORT void VKAPI_CALL
+BCnLayer_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
+                               const VkCopyBufferToImageInfo2 *pCopyBufferToImageInfo)
+{
+	if (!pCopyBufferToImageInfo)
+		return;
+
+	std::vector<VkBufferImageCopy> regions;
+	regions.reserve(pCopyBufferToImageInfo->regionCount);
+
+	for (uint32_t i = 0; i < pCopyBufferToImageInfo->regionCount; i++) {
+		const VkBufferImageCopy2 *r2 = &pCopyBufferToImageInfo->pRegions[i];
+		VkBufferImageCopy r{};
+
+		r.bufferOffset      = r2->bufferOffset;
+		r.bufferRowLength   = r2->bufferRowLength;
+		r.bufferImageHeight = r2->bufferImageHeight;
+		r.imageSubresource.aspectMask     = r2->imageSubresource.aspectMask;
+		r.imageSubresource.mipLevel       = r2->imageSubresource.mipLevel;
+		r.imageSubresource.baseArrayLayer = r2->imageSubresource.baseArrayLayer;
+		r.imageSubresource.layerCount     = r2->imageSubresource.layerCount;
+		r.imageOffset = r2->imageOffset;
+		r.imageExtent = r2->imageExtent;
+
+		regions.push_back(r);
+	}
+
+	BCnLayer_CmdCopyBufferToImage(commandBuffer,
+		pCopyBufferToImageInfo->srcBuffer,
+		pCopyBufferToImageInfo->dstImage,
+		pCopyBufferToImageInfo->dstImageLayout,
+		pCopyBufferToImageInfo->regionCount,
+		regions.data());
+}

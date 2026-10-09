@@ -58,6 +58,21 @@ BCnLayer_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
                               uint32_t regionCount,
                               const VkBufferImageCopy *pRegions);
 
+/* v1 fix: DXVK >= 2.0 only wraps vkCmdCopyBufferToImage2 (copy_commands2 is
+ * in 1.3 core).  Convert VkBufferImageCopy2 regions to legacy VkBufferImageCopy
+ * and forward to the legacy hook above. */
+void VKAPI_CALL
+BCnLayer_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
+                               const VkCopyBufferToImageInfo2 *pCopyBufferToImageInfo);
+
+/* v2 fix: DXVK >= 2.0 queries format support through
+ * vkGetPhysicalDeviceFormatProperties2 with a VkFormatProperties3 in the
+ * pNext chain; mirror the BC patch into both. */
+void VKAPI_CALL
+BCnLayer_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
+                                            VkFormat format,
+                                            VkFormatProperties2 *pFormatProperties);
+
 void VKAPI_CALL
 BCnLayer_GetDeviceQueue(VkDevice device,
                         uint32_t queueFamilyIndex,
